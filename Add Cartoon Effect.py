@@ -8,12 +8,56 @@ from googleapiclient.http import MediaFileUpload
 from google.auth.transport.requests import Request
 import httplib2
 import pickle
+from sklearn.cluster import KMeans
 
 # Constants
 DIRECTORY = 'C:/Users/CPSEGuest/Videos/Captures/'
+colors = [
+    [255, 182, 193],  # Light Pink
+    [255, 239, 179],  # Pastel Yellow
+    [176, 224, 230],  # Powder Blue
+    [152, 251, 152],  # Pale Green
+    [255, 228, 225],  # Misty Rose
+    [255, 240, 245],  # Lavender Blush
+    [240, 248, 255],  # Alice Blue
+    [255, 224, 178],  # Peach Puff
+    [219, 219, 255],  # Periwinkle
+    [255, 204, 229],  # Cotton Candy
+    [255, 192, 203],  # Pink
+    [200, 191, 231],  # Lavender
+    [190, 255, 255],  # Light Cyan
+    [240, 230, 140],  # Khaki
+    [255, 240, 245],  # Lavender Blush
+    [255, 239, 213],  # Blanched Almond
+    [240, 255, 240],  # Honeydew
+    [248, 248, 255],  # Ghost White
+    [248, 222, 126],  # Light Goldenrod Yellow
+    [245, 245, 245],  # White Smoke
+    [255, 218, 185],  # Antique White
+    [255, 228, 196],  # Bisque
+    [255, 239, 196],  # Light Cream
+    [255, 240, 200],  # Cream
+    [200, 255, 200],  # Honeydew
+    [255, 240, 245],  # Lavender Blush
+    [135, 206, 250],  # Light Sky Blue
+    [147, 112, 219],  # Medium Purple
+    [255, 240, 245],  # Lavender Blush
+    [205, 133, 63],   # Peru
+    [255, 182, 193],  # Light Pink
+    [255, 248, 220],  # Cornsilk
+    [224, 255, 255],  # Light Cyan
+    [240, 230, 140],  # Khaki
+    [240, 248, 255],  # Alice Blue
+    [253, 245, 230],  # Old Lace
+    [255, 228, 225],  # Misty Rose
+    [240, 255, 240],  # Honeydew
+    [255, 228, 196],  # Bisque
+]
+
 from moviepy.editor import VideoFileClip
 import cv2
 import numpy as np
+from multiprocessing import Pool
 
 def get_file_title(path):
     # Extract the filename with extension
@@ -22,69 +66,59 @@ def get_file_title(path):
     title, _ = os.path.splitext(filename_with_extension)
     return title
 
-def apply_bilateral_filter(image):
-    """Apply bilateral filter to smooth the image while preserving edges."""
-    return cv2.bilateralFilter(image, d=9, sigmaColor=75, sigmaSpace=75)
+import cv2
+import numpy as np
+from moviepy.editor import VideoFileClip
+from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
 
-def apply_color_quantization(image, k=8):
-    """Reduce the number of colors in the image."""
-    # Convert image to a 2D array of pixels
-    Z = image.reshape((-1, 3))
-    Z = np.float32(Z)
+def find_closest_colors(pixels, colors):
+    """
+    Find the closest color in the 'colors' array to each pixel color in the 'pixels' array.
+    """
+    # Convert colors to a NumPy array if it's not already
+    colors = np.array(colors)
     
-    # Define criteria and apply k-means clustering
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
-    _, label, center = cv2.kmeans(Z, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+    # Compute the squared differences between each pixel and each color
+    pixel_colors_diff = pixels[:, np.newaxis, :] - colors
     
-    # Convert back to uint8 and reshape
-    center = np.uint8(center)
-    res = center[label.flatten()]
-    result_image = res.reshape((image.shape))
+    # Compute squared Euclidean distances
+    distances = np.sum(pixel_colors_diff ** 2, axis=2)
     
-    return result_image
+    # Find the index of the minimum distance for each pixel
+    closest_color_indices = np.argmin(distances, axis=1)
+    
+    # Retrieve the closest colors
+    return colors[closest_color_indices]
 
-def cartoonify_image(image):
-    """Apply cartoon effect with flat colors to an image."""
-    # Apply bilateral filter to smooth the image while preserving edges
-    color = apply_bilateral_filter(image)
+def process_frame(image):
+    global colors
+    """
+    Process the image by rounding pixel colors to the nearest color in the 'colors' array.
+    """
+    # Convert image to float32 for precision
+    image_float = image.astype(np.float32)
     
-    # Convert to grayscale
-    gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
+    # Reshape image to a 2D array where each row is a pixel with [B, G, R] values
+    pixels = image_float.reshape(-1, 3)
     
-    # Apply median blur to the grayscale image
-    gray = cv2.medianBlur(gray, 7)
+    # Find the closest color for each pixel
+    processed_pixels = find_closest_colors(pixels, colors)
     
-    # Detect edges using adaptive thresholding
-    edges = cv2.adaptiveThreshold(gray, 255,
-                                 cv2.ADAPTIVE_THRESH_MEAN_C,
-                                 cv2.THRESH_BINARY, 9, 10)
+    # Reshape back to the original image shape
+    processed_image = processed_pixels.reshape(image.shape).astype(np.uint8)
     
-    # Apply color quantization to reduce the number of colors
-    color_flat = apply_color_quantization(color, k=8)
-    
-    # Convert edges to color
-    edges_colored = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-    
-    # Combine the smoothed color image with the edge image
-    cartoon = cv2.bitwise_and(color_flat, edges_colored)
-    
-    return cartoon
+    return processed_image
 
-def process_frame(frame):
-    """Process each frame and return the result with edges detected."""
-    # Convert frame to numpy array (required for OpenCV)
-    frame_np = np.array(frame)
-    edges_frame = cartoonify_image(frame_np)
-    # Convert back to a moviepy frame
-    return edges_frame
+def process_video(input_path, output_path):
+    """Process the video to flatten colors."""
+    # Load the video
+    clip = VideoFileClip(input_path)
 
-def main(input_video_path, output_video_path):
-    """Process the video to detect edges and save the result."""
-    clip = VideoFileClip(input_video_path)
-    # Apply the edge detection to each frame
+    # Process each frame
     processed_clip = clip.fl_image(process_frame)
-    # Write the result to a file
-    processed_clip.write_videofile(output_video_path, codec='libx264')
+
+    # Write the result to the output file
+    processed_clip.write_videofile(output_path, codec='libx264')
 
 def scan_directory(directory_path):
     video_extensions = {'.mp4', '.mkv', '.avi', '.mov', '.wmv'}
@@ -99,6 +133,7 @@ def scan_directory(directory_path):
     
     return file_list
 
+
 if __name__ == "__main__":
     file_list = scan_directory(DIRECTORY)
     print(file_list)
@@ -106,4 +141,4 @@ if __name__ == "__main__":
         fileName = get_file_title(file)
         input_video = file  # Path to the input video file
         output_video = f"{DIRECTORY}{fileName}Cartoonified.mp4"  # Path to the output video file
-        main(input_video, output_video)
+        process_video(input_video, output_video)
