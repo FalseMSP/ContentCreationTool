@@ -2,13 +2,13 @@ import os
 from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips
 from moviepy.video.fx import resize, crop
 import google.auth
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from google.auth.transport.requests import Request
 import httplib2
 import pickle
 from sklearn.cluster import KMeans
+import cv2
+import numpy as np
+from multiprocessing import Pool
+
 
 # Constants
 DIRECTORY = 'C:/Users/CPSEGuest/Videos/Captures/'
@@ -52,72 +52,67 @@ colors = [
     [255, 228, 225],  # Misty Rose
     [240, 255, 240],  # Honeydew
     [255, 228, 196],  # Bisque
+    [105, 105, 105],  # Dim Gray
+    [169, 169, 169],  # Dark Gray
+    [112, 128, 144],  # Slate Gray
+    [47, 79, 79],     # Dark Slate Gray
+    [139, 0, 0],      # Dark Red
+    [139, 69, 19],    # Saddle Brown
+    [128, 0, 0],      # Maroon
+    [0, 0, 128],      # Navy
+    [0, 100, 0],      # Dark Green
+    [25, 25, 112],    # Midnight Blue
+    [128, 128, 128],  # Gray
+    [85, 107, 47],    # Dark Olive Green
+    [139, 0, 139],    # Dark Violet
+    [75, 0, 130],     # Indigo
+    [0, 0, 139],      # Dark Blue
+    [139, 0, 139],    # Dark Violet
+    [50, 50, 50],     # Charcoal
+    [95, 158, 160],   # Cadet Blue
+    [0, 0, 0],        # Black
+    [75, 0, 130],     # Indigo
+    [64, 64, 64],     # Dark Gray
 ]
 
-from moviepy.editor import VideoFileClip
-import cv2
-import numpy as np
-from multiprocessing import Pool
-
 def get_file_title(path):
-    # Extract the filename with extension
     filename_with_extension = os.path.basename(path)
-    # Split the filename and extension
     title, _ = os.path.splitext(filename_with_extension)
     return title
 
-import cv2
-import numpy as np
-from moviepy.editor import VideoFileClip
-from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
-
 def find_closest_colors(pixels, colors):
-    """
-    Find the closest color in the 'colors' array to each pixel color in the 'pixels' array.
-    """
-    # Convert colors to a NumPy array if it's not already
     colors = np.array(colors)
-    
-    # Compute the squared differences between each pixel and each color
     pixel_colors_diff = pixels[:, np.newaxis, :] - colors
-    
-    # Compute squared Euclidean distances
     distances = np.sum(pixel_colors_diff ** 2, axis=2)
-    
-    # Find the index of the minimum distance for each pixel
     closest_color_indices = np.argmin(distances, axis=1)
-    
-    # Retrieve the closest colors
     return colors[closest_color_indices]
 
 def process_frame(image):
     global colors
-    """
-    Process the image by rounding pixel colors to the nearest color in the 'colors' array.
-    """
+
     # Convert image to float32 for precision
     image_float = image.astype(np.float32)
-    
-    # Reshape image to a 2D array where each row is a pixel with [B, G, R] values
     pixels = image_float.reshape(-1, 3)
-    
-    # Find the closest color for each pixel
     processed_pixels = find_closest_colors(pixels, colors)
-    
-    # Reshape back to the original image shape
     processed_image = processed_pixels.reshape(image.shape).astype(np.uint8)
-    
-    return processed_image
+    cv2.blur(processed_image,(7,7))
+
+    # Convert to grayscale for edge detection
+    gray_image = cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray_image, 100, 200)
+
+    # Create an outline image
+    outline_image = np.zeros_like(processed_image)
+    outline_image[edges != 0] = [0, 0, 0]  # Black outline
+
+    # Combine the processed image and the outline
+    combined_image = cv2.addWeighted(processed_image, 1, outline_image, 1, 0)
+
+    return combined_image
 
 def process_video(input_path, output_path):
-    """Process the video to flatten colors."""
-    # Load the video
     clip = VideoFileClip(input_path)
-
-    # Process each frame
     processed_clip = clip.fl_image(process_frame)
-
-    # Write the result to the output file
     processed_clip.write_videofile(output_path, codec='libx264')
 
 def scan_directory(directory_path):
@@ -132,7 +127,6 @@ def scan_directory(directory_path):
                 file_list.append(file_path)
     
     return file_list
-
 
 if __name__ == "__main__":
     file_list = scan_directory(DIRECTORY)
