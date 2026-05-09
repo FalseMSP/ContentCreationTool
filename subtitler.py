@@ -1,20 +1,24 @@
 """
-subtitler.py – Transcribe video audio with faster-whisper, then burn in
-Open Sans captions using Pillow.  Styling mimics viral Shorts creators:
-large bold text, word-level timing, yellow highlight on the current word,
-heavy black stroke, centred near the bottom of the frame.
+subtitler.py
+
+Pipeline:
+  1. Transcribe audio with faster-whisper (word-level timestamps)
+  2. Write SRT — pause and let the user edit it in their text editor
+  3. Re-read the (possibly edited) SRT
+  4. Burn captions into the video via FFmpeg drawtext — one word at a time,
+     with a scale-bounce pop animation, Open Sans Bold, heavy stroke outline
 """
 
 from __future__ import annotations
 
 import os
-import textwrap
+import re
+import subprocess
+import sys
+import tempfile
+import uuid
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
-
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from moviepy import VideoFileClip, VideoClip
+from typing import List, Optional
 
 from config import SubtitleConfig
 
@@ -24,234 +28,321 @@ from config import SubtitleConfig
 # ---------------------------------------------------------------------------
 
 @dataclass
-class Word:
+class Caption:
+    index: int
+    start: float   # seconds
+    end: float     # seconds
     text: str
-    start: float
-    end: float
-
-
-@dataclass
-class Segment:
-    """A short burst of words shown simultaneously on screen."""
-    words: List[Word]
-
-    @property
-    def start(self) -> float:
-        return self.words[0].start
-
-    @property
-    def end(self) -> float:
-        return self.words[-1].end
-
-    def text_at(self, t: float) -> Tuple[List[str], int]:
-        """
-        Returns (word_texts, highlighted_index) at time *t*.
-        highlighted_index is -1 when no word is active.
-        """
-        texts = [w.text for w in self.words]
-        hi = -1
-        for i, w in enumerate(self.words):
-            if w.start <= t <= w.end:
-                hi = i
-                break
-        return texts, hi
 
 
 # ---------------------------------------------------------------------------
 # Transcription
 # ---------------------------------------------------------------------------
 
-def transcribe(video_path: str, cfg: SubtitleConfig) -> List[Word]:
-    """
-    Use faster-whisper to extract word-level timestamps from the video.
-    Returns a flat list of Word objects.
-    """
+def transcribe(audio_path: str, cfg: SubtitleConfig) -> List[Caption]:
     try:
         from faster_whisper import WhisperModel
     except ImportError:
-        raise ImportError(
-            "faster-whisper is required for subtitles.\n"
-            "Install it with:  pip install faster-whisper"
-        )
+        raise ImportError("py -m pip install faster-whisper")
 
-    print(f"  [subtitler] Loading Whisper model '{cfg.whisper_model}' on {cfg.whisper_device}…")
-    model = WhisperModel(cfg.whisper_model, device=cfg.whisper_device, compute_type=cfg.whisper_compute_type)
-    
+    print(f"  [subtitler] Loading Whisper '{cfg.whisper_model}' on {cfg.whisper_device}…")
+    model = WhisperModel(
+        cfg.whisper_model,
+        device=cfg.whisper_device,
+        compute_type=cfg.whisper_compute_type,
+    )
+
     segments_iter, _ = model.transcribe(
-        video_path,
+        audio_path,
         language=cfg.whisper_language,
         word_timestamps=True,
     )
 
-    words: List[Word] = []
+    captions: List[Caption] = []
+    idx = 1
     for seg in segments_iter:
-        if seg.words:
-            for w in seg.words:
-                words.append(Word(text=w.word.strip(), start=w.start, end=w.end))
-
-    print(f"  [subtitler] Transcribed {len(words)} words.")
-    return words
-
-
-# ---------------------------------------------------------------------------
-# Segment builder
-# ---------------------------------------------------------------------------
-
-def build_segments(words: List[Word], max_per_segment: int) -> List[Segment]:
-    """
-    Group words into short bursts of *max_per_segment* words each.
-    Words with no timestamp gap >0.8 s are kept together.
-    """
-    segments: List[Segment] = []
-    buf: List[Word] = []
-
-    for w in words:
-        if not w.text:
+        if not seg.words:
             continue
-        if buf and (len(buf) >= max_per_segment or w.start - buf[-1].end > 0.8):
-            segments.append(Segment(buf))
-            buf = []
-        buf.append(w)
+        for w in seg.words:
+            text = w.word.strip()
+            if not text:
+                continue
+            captions.append(Caption(
+                index=idx,
+                start=w.start,
+                end=w.end,
+                text=text.upper() if cfg.all_caps else text,
+            ))
+            idx += 1
 
-    if buf:
-        segments.append(Segment(buf))
-
-    return segments
+    print(f"  [subtitler] Transcribed {len(captions)} words.")
+    return captions
 
 
 # ---------------------------------------------------------------------------
-# Frame renderer
+# SRT read / write
 # ---------------------------------------------------------------------------
 
-class SubtitleRenderer:
-    """Renders caption frames as numpy arrays for MoviePy."""
+def _fmt_srt_time(seconds: float) -> str:
+    ms = int(round(seconds * 1000))
+    h  = ms // 3_600_000; ms %= 3_600_000
+    m  = ms // 60_000;    ms %= 60_000
+    s  = ms // 1_000;     ms %= 1_000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-    def __init__(self, cfg: SubtitleConfig, frame_size: Tuple[int, int]):
-        self.cfg = cfg
-        self.w, self.h = frame_size          # (width, height) in pixels
-        self._load_font()
 
-    # ------------------------------------------------------------------
-    def _load_font(self) -> None:
-        cfg = self.cfg
-        if not os.path.isfile(cfg.font_path):
-            raise FileNotFoundError(
-                f"Font not found: {cfg.font_path}\n"
-                "Download Open Sans Bold from fonts.google.com and place it at that path."
-            )
-        self.font = ImageFont.truetype(cfg.font_path, cfg.font_size)
+def _parse_srt_time(t: str) -> float:
+    t = t.replace(",", ".")
+    h, m, s = t.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
 
-    # ------------------------------------------------------------------
-    def _word_widths(self, words: List[str]) -> List[int]:
-        """Measure pixel width of each word (including trailing space)."""
-        tmp = Image.new("RGBA", (1, 1))
-        draw = ImageDraw.Draw(tmp)
-        widths = []
-        for word in words:
-            bb = draw.textbbox((0, 0), word + " ", font=self.font)
-            widths.append(bb[2] - bb[0])
-        return widths
 
-    # ------------------------------------------------------------------
-    def render_frame(
-        self,
-        words: List[str],
-        highlighted: int,
-        frame_array: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Composites subtitle text onto *frame_array* (H×W×3 uint8).
-        Returns a new H×W×3 array.
-        """
-        cfg = self.cfg
-        img = Image.fromarray(frame_array).convert("RGBA")
-        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
+def write_srt(captions: List[Caption], path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for cap in captions:
+            f.write(f"{cap.index}\n")
+            f.write(f"{_fmt_srt_time(cap.start)} --> {_fmt_srt_time(cap.end)}\n")
+            f.write(cap.text + "\n\n")
 
-        display_words = [w.upper() if cfg.all_caps else w for w in words]
-        word_widths = self._word_widths(display_words)
-        total_width = sum(word_widths)
 
-        # --- Background pill ---
-        if cfg.background_enabled:
-            padding = 20
-            pill_x0 = self.w // 2 - total_width // 2 - padding
-            pill_y0 = int(self.h * cfg.vertical_position) - cfg.font_size // 2 - padding
-            pill_x1 = self.w // 2 + total_width // 2 + padding
-            pill_y1 = int(self.h * cfg.vertical_position) + cfg.font_size // 2 + padding
-            bg_color = (*cfg.background_color, cfg.background_opacity)
-            draw.rounded_rectangle([pill_x0, pill_y0, pill_x1, pill_y1], radius=20, fill=bg_color)
+def read_srt(path: str) -> List[Caption]:
+    """Parse an SRT file back into Caption objects."""
+    text = open(path, encoding="utf-8").read()
+    blocks = [b.strip() for b in re.split(r"\n{2,}", text) if b.strip()]
+    captions = []
+    for block in blocks:
+        lines = block.splitlines()
+        if len(lines) < 3:
+            continue
+        try:
+            idx = int(lines[0])
+        except ValueError:
+            continue
+        start_s, end_s = lines[1].split(" --> ")
+        caption_text = " ".join(lines[2:]).strip()
+        captions.append(Caption(
+            index=idx,
+            start=_parse_srt_time(start_s.strip()),
+            end=_parse_srt_time(end_s.strip()),
+            text=caption_text,
+        ))
+    return captions
 
-        # --- Draw each word ---
-        cursor_x = self.w // 2 - total_width // 2
-        y = int(self.h * cfg.vertical_position) - cfg.font_size // 2
 
-        for i, (word, ww) in enumerate(zip(display_words, word_widths)):
-            color = cfg.highlight_color if (cfg.highlight_current_word and i == highlighted) else cfg.text_color
+# ---------------------------------------------------------------------------
+# Interactive SRT edit pause
+# ---------------------------------------------------------------------------
 
-            # Stroke (drawn first, slightly offset in 8 directions)
-            for dx in range(-cfg.stroke_width, cfg.stroke_width + 1, max(1, cfg.stroke_width // 2)):
-                for dy in range(-cfg.stroke_width, cfg.stroke_width + 1, max(1, cfg.stroke_width // 2)):
-                    if dx == 0 and dy == 0:
-                        continue
-                    draw.text(
-                        (cursor_x + dx, y + dy),
-                        word,
-                        font=self.font,
-                        fill=(*cfg.stroke_color, 255),
-                    )
+def prompt_edit_srt(srt_path: str) -> None:
+    """
+    Open the SRT in the user's default text editor and wait for them
+    to confirm before continuing the burn-in step.
+    """
+    print()
+    print("=" * 60)
+    print("  SUBTITLE REVIEW")
+    print("=" * 60)
+    print(f"  SRT file: {srt_path}")
+    print()
+    print("  Opening in your default text editor…")
+    print("  Edit any mistranscribed words, save the file, then")
+    print("  come back here and press ENTER to continue.")
+    print("=" * 60)
 
-            # Main text
-            draw.text((cursor_x, y), word, font=self.font, fill=(*color, 255))
-            cursor_x += ww
+    # Open in default system editor (works on Windows, mac, Linux)
+    try:
+        if sys.platform == "win32":
+            os.startfile(srt_path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", srt_path])
+        else:
+            subprocess.Popen(["xdg-open", srt_path])
+    except Exception as e:
+        print(f"  (Could not auto-open editor: {e})")
+        print(f"  Please open manually: {srt_path}")
 
-        # Composite
-        result = Image.alpha_composite(img, overlay).convert("RGB")
-        return np.array(result)
+    input("\n  Press ENTER when you're done editing… ")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# FFmpeg burn-in
+# ---------------------------------------------------------------------------
+
+def _escape_ffmpeg(text: str) -> str:
+    """Escape text for FFmpeg drawtext.
+
+    text= is wrapped in single quotes in the filter chain, so any
+    apostrophe breaks parsing and must be stripped entirely.
+    """
+    text = text.replace("\\", "\\\\")
+    text = text.replace("\u2019", "")  # right curly apostrophe
+    text = text.replace("\u2018", "")  # left curly apostrophe
+    text = text.replace("'", "")        # straight apostrophe
+    text = text.replace(":", "\\:")
+    text = text.replace("%", "\\%")
+    return text
+
+
+def burn_subtitles_ffmpeg(
+    input_video: str,
+    output_video: str,
+    captions: List[Caption],
+    cfg: SubtitleConfig,
+) -> None:
+    """
+    Burn captions into video using FFmpeg drawtext filters.
+    One word per filter entry with a scale-bounce pop animation.
+
+    Animation:
+      - Word scales from 1.15x → 1.0x over the first 6 frames (pop-in)
+      - Full opacity for the duration
+      - Disappears on the next word's start
+    """
+    if not captions:
+        print("  [subtitler] No captions to burn in, copying video as-is.")
+        import shutil
+        shutil.copy2(input_video, output_video)
+        return
+
+    font_path = os.path.abspath(cfg.font_path)
+    if not os.path.isfile(font_path):
+        raise FileNotFoundError(
+            f"Font not found: {font_path}\n"
+            "Download OpenSans-Bold.ttf from fonts.google.com → fonts/OpenSans-Bold.ttf"
+        )
+
+    # FFmpeg on Windows needs forward slashes and escaped colons in paths
+    font_path_ffmpeg = font_path.replace("\\", "/").replace(":", "\\:")
+
+    # Vertical position in pixels  (cfg.vertical_position is 0-1 fraction)
+    # We use FFmpeg expressions so it works for any resolution
+    y_expr = f"(h*{cfg.vertical_position:.4f})-(text_h/2)"
+
+    filters = []
+    fps_approx = 60  # used only for bounce frame count — close enough
+
+    for cap in captions:
+        text = _escape_ffmpeg(cap.text)
+        s = cap.start
+        e = cap.end
+        bounce_dur = min(6 / fps_approx, (e - s) * 0.4)  # pop-in over first ~6 frames
+
+        # Scale expression: interpolates from 1.15 to 1.0 during bounce_dur,
+        # then holds at 1.0.  FFmpeg drawtext doesn't support true scale, so
+        # we achieve the pop by animating fontsize.
+        base_size = cfg.font_size
+        big_size  = int(base_size * 1.18)
+
+        # fontsize lerp: big_size → base_size over bounce_dur seconds
+        # after bounce_dur: stays at base_size
+        size_expr = (
+            f"if(lt(t-{s:.4f},{bounce_dur:.4f}),"
+            f"{big_size}+({base_size}-{big_size})*((t-{s:.4f})/{bounce_dur:.4f}),"
+            f"{base_size})"
+        )
+
+        # x centred accounting for variable font size — approximate with base
+        x_expr = "(w-text_w)/2"
+
+        # Build one drawtext filter per word
+        # Stroke is simulated with borderw / bordercolor
+        f = (
+            f"drawtext="
+            f"fontfile='{font_path_ffmpeg}':"
+            f"text='{text}':"
+            f"fontsize={size_expr}:"
+            f"fontcolor={_rgb_to_hex(cfg.text_color)}:"
+            f"borderw={cfg.stroke_width}:"
+            f"bordercolor={_rgb_to_hex(cfg.stroke_color)}:"
+            f"x={x_expr}:"
+            f"y={y_expr}:"
+            f"enable='between(t,{s:.4f},{e:.4f})'"
+        )
+        filters.append(f)
+
+    filter_chain = ",".join(filters)
+
+    # Normalise to forward slashes for FFmpeg on Windows
+    input_ffmpeg  = input_video.replace("\\", "/")
+    output_ffmpeg = output_video.replace("\\", "/")
+
+    # Write filter chain to a temp file to avoid Windows CLI length limits
+    # and any shell quoting issues with the output path.
+    tmp_filter_path = None
+    try:
+        tmp_filter_fd, tmp_filter_path = tempfile.mkstemp(
+            suffix=".txt", prefix="shorts_filter_"
+        )
+        with os.fdopen(tmp_filter_fd, "w", encoding="utf-8") as fh:
+            fh.write(filter_chain)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_ffmpeg,
+            "-filter_script:v", tmp_filter_path,
+            "-codec:a", "copy",
+            output_ffmpeg,
+        ]
+
+        print(f"  [subtitler] Burning {len(captions)} captions with FFmpeg\u2026")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("  [subtitler] FFmpeg error:")
+            print(result.stderr[-2000:])
+            raise RuntimeError("FFmpeg burn-in failed. See error above.")
+    finally:
+        if tmp_filter_path and os.path.exists(tmp_filter_path):
+            try:
+                os.remove(tmp_filter_path)
+            except Exception:
+                pass
+
+    print(f"  [subtitler] Burn-in complete \u2192 {output_video}")
+
+
+def _rgb_to_hex(rgb: tuple) -> str:
+    return "#{:02X}{:02X}{:02X}".format(*rgb)
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def add_subtitles(video: VideoFileClip, cfg: SubtitleConfig) -> VideoFileClip:
+def process_subtitles(
+    video_path: str,
+    output_path: str,
+    srt_path: str,
+    cfg: SubtitleConfig,
+    interactive: bool = True,
+) -> None:
     """
-    Transcribe *video*, build word-timed segments, and return a new
-    VideoFileClip with captions burned in.
+    Full subtitle pipeline:
+      1. Extract audio → transcribe → write SRT
+      2. (If interactive) open SRT for user to edit, wait for ENTER
+      3. Re-read SRT (picks up any edits)
+      4. Burn captions into video via FFmpeg
     """
-    # Write audio to a temp file for Whisper
-    import tempfile, uuid
+    # Step 1: transcribe
     tmp_audio = os.path.join(tempfile.gettempdir(), f"shorts_audio_{uuid.uuid4().hex}.wav")
     try:
-        video.audio.write_audiofile(tmp_audio, logger=None)
-        words = transcribe(tmp_audio, cfg)
+        from moviepy import VideoFileClip
+        clip = VideoFileClip(video_path)
+        clip.audio.write_audiofile(tmp_audio, logger=None)
+        clip.close()
+        captions = transcribe(tmp_audio, cfg)
     finally:
         if os.path.exists(tmp_audio):
             os.remove(tmp_audio)
 
-    segments = build_segments(words, cfg.max_words_per_segment)
-    renderer = SubtitleRenderer(cfg, (video.w, video.h))
+    write_srt(captions, srt_path)
 
-    # Build a lookup: for any time t, which segment is active?
-    def get_active_segment(t: float) -> Optional[Segment]:
-        for seg in segments:
-            if seg.start <= t <= seg.end:
-                return seg
-        return None
+    # Step 2: let user edit
+    if interactive:
+        prompt_edit_srt(srt_path)
 
-    # Wrap make_frame to composite subtitles
-    original_make_frame = video.get_frame
+    # Step 3: re-read (captures edits)
+    captions = read_srt(srt_path)
 
-    def make_frame_with_subs(t: float) -> np.ndarray:
-        frame = original_make_frame(t)
-        seg = get_active_segment(t)
-        if seg is None:
-            return frame
-        word_texts, hi = seg.text_at(t)
-        return renderer.render_frame(word_texts, hi, frame)
-
-    from moviepy import VideoClip
-    result = VideoClip(make_frame_with_subs, duration=video.duration)
-    result = result.with_audio(video.audio)
-    result = result.with_fps(video.fps)
-    return result
+    # Step 4: burn in
+    burn_subtitles_ffmpeg(video_path, output_path, captions, cfg)
