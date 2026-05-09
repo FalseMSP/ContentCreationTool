@@ -1,4 +1,32 @@
-google-auth-oauthlib
-google-auth-httplib2
-google-api-python-client
-moviepy
+# Core video processing
+moviepy>=2.0.0
+
+# Subtitle transcription
+faster-whisper>=1.0.0
+
+# Image compositing for subtitle rendering
+Pillow>=10.0.0
+
+# YouTube Data API
+google-api-python-client>=2.0.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.0.0
+
+# Numpy (pulled in by moviepy/Pillow but listed explicitly)
+numpy>=1.24.0
+
+# ---------------------------------------------------------------------------
+# GPU acceleration (RTX 50-series / CUDA 12.8)
+# Install these separately -- pip can't resolve the --index-url automatically:
+#
+#   py -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+#
+# For older CUDA versions:
+#   CUDA 12.1  ->  cu121
+#   CUDA 11.8  ->  cu118
+#
+# After installing, set in config.py:
+#   whisper_model        = "large-v3"
+#   whisper_device       = "cuda"
+#   whisper_compute_type = "float16"
+# ---------------------------------------------------------------------------
