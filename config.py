@@ -34,7 +34,7 @@ TRIM_FRONT_SECONDS: float = 0.0
 TRIM_END_SECONDS:   float = 0.0
 OUTPUT_WIDTH        = 1080
 OUTPUT_HEIGHT       = 1920
-SHORTS_MAX_DURATION = 59    # YouTube Shorts hard limit (seconds)
+SHORTS_MAX_DURATION = 9999    # YouTube Shorts hard limit (seconds)
 
 # ---------------------------------------------------------------------------
 # Subtitle configuration
@@ -75,7 +75,7 @@ class SubtitleConfig:
     """
 
     # --- Transcription ---
-    whisper_model:        str           = "large-v3"
+    whisper_model:        str           = "base"
     whisper_device:       str           = "cuda"
     whisper_compute_type: str           = "float16"  # "float16" GPU | "int8" CPU
     whisper_language:     Optional[str] = None       # None = auto-detect

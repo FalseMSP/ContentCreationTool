@@ -76,6 +76,19 @@ def transcribe(audio_path: str, cfg: SubtitleConfig) -> List[Caption]:
             idx += 1
 
     print(f"  [subtitler] Transcribed {len(captions)} words.")
+
+    # Explicitly free the model from VRAM before returning.
+    # large-v3 holds ~3 GB of VRAM; without this, FFmpeg can crash
+    # the process due to out-of-memory on the GPU/system.
+    try:
+        del model
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print("  [subtitler] VRAM freed.")
+    except Exception:
+        pass  # non-CUDA or torch not installed — safe to ignore
+
     return captions
 
 
